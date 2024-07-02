@@ -10,7 +10,6 @@
 
 #define pr_fmt(fmt) "ashmem: " fmt
 
-#include <linux/module.h>
 #include <linux/init.h>
 #include <linux/export.h>
 #include <linux/file.h>
@@ -181,6 +180,7 @@ static inline void lru_del(struct ashmem_range *range)
  * @purged:	   Initial purge status (ASMEM_NOT_PURGED or ASHMEM_WAS_PURGED)
  * @start:	   The starting page (inclusive)
  * @end:	   The ending page (inclusive)
+ * @new_range:	   The placeholder for the new range
  *
  * This function is protected by ashmem_mutex.
  */
@@ -373,7 +373,7 @@ ashmem_vmfile_get_unmapped_area(struct file *file, unsigned long addr,
 				unsigned long len, unsigned long pgoff,
 				unsigned long flags)
 {
-	return current->mm->get_unmapped_area(file, addr, len, pgoff, flags);
+	return mm_get_unmapped_area(current->mm, file, addr, len, pgoff, flags);
 }
 
 static int ashmem_mmap(struct file *file, struct vm_area_struct *vma)
@@ -402,7 +402,7 @@ static int ashmem_mmap(struct file *file, struct vm_area_struct *vma)
 		ret = -EPERM;
 		goto out;
 	}
-	vma->vm_flags &= ~calc_vm_may_flags(~asma->prot_mask);
+	vm_flags_clear(vma, calc_vm_may_flags(~asma->prot_mask));
 
 	if (!asma->file) {
 		char *name = ASHMEM_NAME_DEF;
@@ -452,9 +452,9 @@ static int ashmem_mmap(struct file *file, struct vm_area_struct *vma)
 		vma_set_anonymous(vma);
 	}
 
-	if (vma->vm_file)
-		fput(vma->vm_file);
-	vma->vm_file = asma->file;
+	vma_set_file(vma, asma->file);
+	/* XXX: merge this with the get_file() above if possible */
+	fput(asma->file);
 
 out:
 	mutex_unlock(&ashmem_mutex);
@@ -528,15 +528,27 @@ ashmem_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
 	return lru_count;
 }
 
-static struct shrinker ashmem_shrinker = {
-	.count_objects = ashmem_shrink_count,
-	.scan_objects = ashmem_shrink_scan,
-	/*
-	 * XXX (dchinner): I wish people would comment on why they need on
-	 * significant changes to the default value here
-	 */
-	.seeks = DEFAULT_SEEKS * 4,
-};
+static struct shrinker *ashmem_shrinker;
+
+int ashmem_shrinker_init(void)
+{
+	ashmem_shrinker = shrinker_alloc(SHRINKER_NUMA_AWARE, "ashmem");
+	if (!ashmem_shrinker)
+		return -ENOMEM;
+
+	ashmem_shrinker->count_objects = ashmem_shrink_count;
+	ashmem_shrinker->scan_objects = ashmem_shrink_scan;
+	ashmem_shrinker->seeks = DEFAULT_SEEKS * 4;
+
+	shrinker_register(ashmem_shrinker);
+
+	return 0;
+}
+
+void ashmem_shrinker_exit(void)
+{
+	shrinker_free(ashmem_shrinker);
+}
 
 static int set_prot_mask(struct ashmem_area *asma, unsigned long prot)
 {
@@ -569,7 +581,7 @@ static int set_name(struct ashmem_area *asma, void __user *name)
 
 	/*
 	 * Holding the ashmem_mutex while doing a copy_from_user might cause
-	 * an data abort which would try to access mmap_sem. If another
+	 * an data abort which would try to access mmap_lock. If another
 	 * thread has invoked ashmem_mmap then it will be holding the
 	 * semaphore and will be waiting for ashmem_mutex, there by leading to
 	 * deadlock. We'll release the mutex and take the name to a local
@@ -579,14 +591,14 @@ static int set_name(struct ashmem_area *asma, void __user *name)
 	len = strncpy_from_user(local_name, name, ASHMEM_NAME_LEN);
 	if (len < 0)
 		return len;
-	if (len == ASHMEM_NAME_LEN)
-		local_name[ASHMEM_NAME_LEN - 1] = '\0';
+
 	mutex_lock(&ashmem_mutex);
 	/* cannot change an existing mapping's name */
 	if (asma->file)
 		ret = -EINVAL;
 	else
-		strcpy(asma->name + ASHMEM_NAME_PREFIX_LEN, local_name);
+		strscpy(asma->name + ASHMEM_NAME_PREFIX_LEN, local_name,
+			ASHMEM_NAME_LEN);
 
 	mutex_unlock(&ashmem_mutex);
 	return ret;
@@ -600,7 +612,7 @@ static int get_name(struct ashmem_area *asma, void __user *name)
 	 * Have a local variable to which we'll copy the content
 	 * from asma with the lock held. Later we can copy this to the user
 	 * space safely without holding any locks. So even if we proceed to
-	 * wait for mmap_sem, it won't lead to deadlock.
+	 * wait for mmap_lock, it won't lead to deadlock.
 	 */
 	char local_name[ASHMEM_NAME_LEN];
 
@@ -857,8 +869,8 @@ static long ashmem_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				.gfp_mask = GFP_KERNEL,
 				.nr_to_scan = LONG_MAX,
 			};
-			ret = ashmem_shrink_count(&ashmem_shrinker, &sc);
-			ashmem_shrink_scan(&ashmem_shrinker, &sc);
+			ret = ashmem_shrink_count(ashmem_shrinker, &sc);
+			ashmem_shrink_scan(ashmem_shrinker, &sc);
 		}
 		break;
 	}
@@ -895,6 +907,8 @@ static void ashmem_show_fdinfo(struct seq_file *m, struct file *file)
 	if (asma->name[ASHMEM_NAME_PREFIX_LEN] != '\0')
 		seq_printf(m, "name:\t%s\n",
 			   asma->name + ASHMEM_NAME_PREFIX_LEN);
+
+	seq_printf(m, "size:\t%zu\n", asma->size);
 
 	mutex_unlock(&ashmem_mutex);
 }
@@ -935,7 +949,7 @@ static int __init ashmem_init(void)
 
 	ashmem_range_cachep = kmem_cache_create("ashmem_range_cache",
 						sizeof(struct ashmem_range),
-						0, 0, NULL);
+						0, SLAB_RECLAIM_ACCOUNT, NULL);
 	if (!ashmem_range_cachep) {
 		pr_err("failed to create slab cache\n");
 		goto out_free1;
@@ -947,7 +961,7 @@ static int __init ashmem_init(void)
 		goto out_free2;
 	}
 
-	ret = register_shrinker(&ashmem_shrinker);
+	ret = ashmem_shrinker_init();
 	if (ret) {
 		pr_err("failed to register shrinker!\n");
 		goto out_demisc;
@@ -970,12 +984,12 @@ out:
 // HACKED
 static void __exit ashmem_exit(void)
 {
-	unregister_shrinker(&ashmem_shrinker);
+       ashmem_shrinker_exit();
 
-	misc_deregister(&ashmem_misc);
+       misc_deregister(&ashmem_misc);
 
-	kmem_cache_destroy(ashmem_range_cachep);
-	kmem_cache_destroy(ashmem_area_cachep);
+       kmem_cache_destroy(ashmem_range_cachep);
+       kmem_cache_destroy(ashmem_area_cachep);
 }
 
 module_init(ashmem_init);
